@@ -28,35 +28,132 @@ import                  Network.Simple.TCP              as S
 import qualified        Data.Text                       as T
 import qualified        Data.Text.Encoding              as E
 import                  Data.Array                      as A
+import                  Data.List                       as L
+
+-- Note: the naming would be more precise if we prepended `Shared` to each
+type CyclicalBuffer = TVar (A.Array Int T.Text)
+type BufferPointer = TVar Int
+type BufferCount = TVar Int
+type BufferMutex = MVar ()
+
+-- storing last n messages using cyclical buffer
+data MessageHistory = MessageHistory {
+    buffer :: CyclicalBuffer,
+    pointer :: BufferPointer,
+    count :: BufferCount,
+    mutex :: BufferMutex
+}
+
+-- channel containing messages broadcasted to a room
+type Broadcast = TChan T.Text
+
+data Room = Room {
+    name :: String,
+    password :: String,
+    messages :: MessageHistory,
+    broadcast :: Broadcast
+}
 
 -- broadcast messages to all connected users + send stored messages
 serve :: IO ()
 serve = withSocketsDo $ do
-    bchan <- newBroadcastTChanIO :: IO (TChan T.Text)
+    bchanR <- newBroadcastTChanIO :: IO (TChan T.Text)
 
     -- shared cyclical buffer and related variables
-    previous <- newTVarIO $ A.array (0,4) [(i, T.pack "")|i<-[0..4]]
-    previous_pointer <- newTVarIO 0
-    previous_count <- newTVarIO 0
+    previousR <- newTVarIO $ A.array (0,4) [(i, T.pack "")|i<-[0..4]]
+    previousPointerR <- newTVarIO 0
+    previousCountR <- newTVarIO 0
 
     -- to prevent simultaneous access to cyclical buffer from multiple threads
-    mutex <- newEmptyMVar :: IO (MVar ())
-    putMVar mutex ()
+    mutexR <- newEmptyMVar :: IO (MVar ())
+    putMVar mutexR ()
+
+    let history = MessageHistory previousR previousPointerR previousCountR mutexR
+    rooms <- return [Room "name" "passwd" history bchanR]
 
     listen (Host "127.0.0.1") "8000" $ \(listenSocket, listenAddr) -> do
         putStrLn $ "Listening for TCP connections at " ++ show listenAddr
         forever . acceptFork listenSocket $ \(acceptSocket, acceptAddr) -> do
             putStrLn $ "Accepted incoming connection from " ++ show acceptAddr
 
-            -- partial function applications
-            let 
-                bufferInsert = insertPrevious previous previous_pointer previous_count mutex
-                bufferSend = sendPrevious acceptSocket previous previous_pointer previous_count mutex
+            -- what room does the user want to join
+            maybeRoom <- roomPrompt acceptSocket rooms
 
-            messageJoined acceptAddr bchan
-            finally     (handleClient acceptSocket acceptAddr bchan bufferInsert bufferSend)
-                        (messageLeft acceptAddr bchan)
+            case maybeRoom of
+                Just room -> do
+                    -- room shared variables
+                    let 
+                        bchan = broadcast room
+                        
+                        previous = buffer $ messages room
+                        previousPointer = pointer $ messages room
+                        previousCount = count $ messages room
+                        mx = mutex $ messages room
+
+                    -- partial function applications
+                    let 
+                        bufferInsert = insertPrevious previous previousPointer previousCount mx
+                        bufferSend = sendPrevious acceptSocket previous previousPointer previousCount mx
+
+                    messageJoined acceptAddr bchan
+                    finally     (handleClient acceptSocket acceptAddr bchan bufferInsert bufferSend)
+                                (messageLeft acceptAddr bchan)
+                Nothing -> return ()
+
             putStrLn $ "Closing connection from " ++ show acceptAddr
+
+-- return Just roomName specified by user or Nothing if he disconnects
+roomPrompt :: Socket -> [Room] -> IO (Maybe Room)
+roomPrompt socket rooms = do
+    send socket "Insert name of the room you would like to join: "
+    maybeResponse <- recv socket 4096
+    case maybeResponse of
+        Just response -> case E.decodeUtf8' response of
+            -- decoding failed
+            Left _ -> do 
+                return Nothing
+            -- decoding succeeded
+            Right rName -> 
+                case getRoom rooms (T.unpack $ T.strip $ rName) of
+                    Just room -> do
+                        knowsPasswd <- passwordPrompt socket room
+                        if knowsPasswd 
+                        then return $ Just room
+                        else
+                            return Nothing
+                    Nothing -> do
+                        send socket "Room does not exist!\n"
+                        roomPrompt socket rooms
+
+        Nothing -> return Nothing
+
+-- return True if user passes correct password, False otherwise
+passwordPrompt :: Socket -> Room -> IO Bool
+passwordPrompt socket room = do
+    send socket "Insert room password: "
+    maybeResponse <- recv socket 4096
+    case maybeResponse of
+        Just response -> case E.decodeUtf8' response of
+            -- decoding failed
+            Left _ -> do 
+                return False
+            -- decoding succeeded
+            Right passwd -> 
+                if (password room) == (T.unpack $ T.strip $ passwd)
+                then do
+                    send socket "Connected succesfuly!\n"
+                    return True
+                else do
+                    send socket "Wrong password!\n"
+                    passwordPrompt socket room
+
+        Nothing -> return False
+
+-- return room with given name if it exists
+getRoom :: [Room] -> String -> Maybe Room
+getRoom rooms rName = L.find check rooms
+    where 
+        check room = (name room) == rName
 
 -- insert message to a cyclical buffer (contains last n messages)
 insertPrevious :: TVar (Array Int T.Text) -> TVar Int -> TVar Int -> MVar () -> T.Text -> IO ()
