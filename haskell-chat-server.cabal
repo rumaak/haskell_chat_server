@@ -27,6 +27,7 @@ executable haskell-chat-server
                        text >=1.2.4.1,
                        directory >= 1.3.6.0,
                        array >= 0.5.4.0,
+                       split >= 0.2.3.4,
                        network-simple
   hs-source-dirs:      app, src
   default-language:    Haskell2010

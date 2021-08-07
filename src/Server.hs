@@ -29,6 +29,7 @@ import qualified        Data.Text                       as T
 import qualified        Data.Text.Encoding              as E
 import                  Data.Array                      as A
 import                  Data.List                       as L
+import                  Data.List.Split
 
 -- Note: the naming would be more precise if we prepended `Shared` to each
 type CyclicalBuffer = TVar (A.Array Int T.Text)
@@ -57,19 +58,7 @@ data Room = Room {
 -- broadcast messages to all connected users + send stored messages
 serve :: IO ()
 serve = withSocketsDo $ do
-    bchanR <- newBroadcastTChanIO :: IO (TChan T.Text)
-
-    -- shared cyclical buffer and related variables
-    previousR <- newTVarIO $ A.array (0,4) [(i, T.pack "")|i<-[0..4]]
-    previousPointerR <- newTVarIO 0
-    previousCountR <- newTVarIO 0
-
-    -- to prevent simultaneous access to cyclical buffer from multiple threads
-    mutexR <- newEmptyMVar :: IO (MVar ())
-    putMVar mutexR ()
-
-    let history = MessageHistory previousR previousPointerR previousCountR mutexR
-    rooms <- return [Room "name" "passwd" history bchanR]
+    rooms <- parseConfig "server_conf/rooms_default.conf"
 
     listen (Host "127.0.0.1") "8000" $ \(listenSocket, listenAddr) -> do
         putStrLn $ "Listening for TCP connections at " ++ show listenAddr
@@ -101,6 +90,30 @@ serve = withSocketsDo $ do
                 Nothing -> return ()
 
             putStrLn $ "Closing connection from " ++ show acceptAddr
+
+-- for each properly specified room in config, create corresponding room
+parseConfig :: FilePath -> IO [Room]
+parseConfig filepath = do
+    lines <- fmap lines (readFile filepath)
+    linesSplit <- return $ map (splitOn ":") lines
+    mapM (uncurry createRoom) [((line!!0), (line!!1)) | line <- linesSplit, (length line) == 2]
+
+-- initialize shared variables for single room identified by name and password
+createRoom :: String -> String -> IO Room
+createRoom name passwd = do
+    bchanR <- newBroadcastTChanIO :: IO (TChan T.Text)
+
+    -- shared cyclical buffer and related variables
+    previousR <- newTVarIO $ A.array (0,4) [(i, T.pack "")|i<-[0..4]]
+    previousPointerR <- newTVarIO 0
+    previousCountR <- newTVarIO 0
+
+    -- to prevent simultaneous access to cyclical buffer from multiple threads
+    mutexR <- newEmptyMVar :: IO (MVar ())
+    putMVar mutexR ()
+
+    let history = MessageHistory previousR previousPointerR previousCountR mutexR
+    return $ Room name passwd history bchanR
 
 -- return Just roomName specified by user or Nothing if he disconnects
 roomPrompt :: Socket -> [Room] -> IO (Maybe Room)
