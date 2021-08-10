@@ -30,6 +30,9 @@ import qualified        Data.Text.Encoding              as E
 import                  Data.Array                      as A
 import                  Data.List                       as L
 import                  Data.List.Split
+import                  System.Environment
+import                  Data.Tuple.Extra
+import                  Text.Read
 
 -- Note: the naming would be more precise if we prepended `Shared` to each
 type CyclicalBuffer = TVar (A.Array Int T.Text)
@@ -51,6 +54,7 @@ type Broadcast = TChan T.Text
 data Room = Room {
     name :: String,
     password :: String,
+    memorySize :: Int,
     messages :: MessageHistory,
     broadcast :: Broadcast
 }
@@ -58,7 +62,8 @@ data Room = Room {
 -- broadcast messages to all connected users + send stored messages
 serve :: IO ()
 serve = withSocketsDo $ do
-    rooms <- parseConfig "server_conf/rooms_default.conf"
+    config <- getConfigName
+    rooms <- parseConfig config
 
     listen (Host "127.0.0.1") "8000" $ \(listenSocket, listenAddr) -> do
         putStrLn $ "Listening for TCP connections at " ++ show listenAddr
@@ -70,19 +75,12 @@ serve = withSocketsDo $ do
 
             case maybeRoom of
                 Just room -> do
-                    -- room shared variables
-                    let 
-                        bchan = broadcast room
-                        
-                        previous = buffer $ messages room
-                        previousPointer = pointer $ messages room
-                        previousCount = count $ messages room
-                        mx = mutex $ messages room
+                    let bchan = broadcast room
 
                     -- partial function applications
                     let 
-                        bufferInsert = insertPrevious previous previousPointer previousCount mx
-                        bufferSend = sendPrevious acceptSocket previous previousPointer previousCount mx
+                        bufferInsert = insertPrevious room
+                        bufferSend = sendPrevious acceptSocket room
 
                     messageJoined acceptAddr bchan
                     finally     (handleClient acceptSocket acceptAddr bchan bufferInsert bufferSend)
@@ -91,20 +89,37 @@ serve = withSocketsDo $ do
 
             putStrLn $ "Closing connection from " ++ show acceptAddr
 
+-- use specified config file or fall back to default
+getConfigName :: IO String
+getConfigName = do
+    args <- getArgs
+    if (length args) < 1
+        then return "server_conf/rooms_default.conf"
+        else return $ args!!0 
+
 -- for each properly specified room in config, create corresponding room
 parseConfig :: FilePath -> IO [Room]
 parseConfig filepath = do
     lines <- fmap lines (readFile filepath)
     linesSplit <- return $ map (splitOn ":") lines
-    mapM (uncurry createRoom) [((line!!0), (line!!1)) | line <- linesSplit, (length line) == 2]
+    mapM (uncurry3 createRoom) [tup line | line <- linesSplit, check line]
+    where
+        tup l = (l!!0, l!!1, read (l!!2) :: Int)
+        check l = ((length l) == 3) && (readable (l!!2))
+
+-- whether String can be read as an Int
+readable :: String -> Bool
+readable s = case readMaybe s :: Maybe Int of
+    Just _ -> True
+    Nothing -> False
 
 -- initialize shared variables for single room identified by name and password
-createRoom :: String -> String -> IO Room
-createRoom name passwd = do
+createRoom :: String -> String -> Int -> IO Room
+createRoom name passwd memSize = do
     bchanR <- newBroadcastTChanIO :: IO (TChan T.Text)
 
     -- shared cyclical buffer and related variables
-    previousR <- newTVarIO $ A.array (0,4) [(i, T.pack "")|i<-[0..4]]
+    previousR <- newTVarIO $ A.array (0,memSize-1) [(i, T.pack "")|i<-[0..(memSize-1)]]
     previousPointerR <- newTVarIO 0
     previousCountR <- newTVarIO 0
 
@@ -113,7 +128,7 @@ createRoom name passwd = do
     putMVar mutexR ()
 
     let history = MessageHistory previousR previousPointerR previousCountR mutexR
-    return $ Room name passwd history bchanR
+    return $ Room name passwd memSize history bchanR
 
 -- return Just roomName specified by user or Nothing if he disconnects
 roomPrompt :: Socket -> [Room] -> IO (Maybe Room)
@@ -169,37 +184,51 @@ getRoom rooms rName = L.find check rooms
         check room = (name room) == rName
 
 -- insert message to a cyclical buffer (contains last n messages)
-insertPrevious :: TVar (Array Int T.Text) -> TVar Int -> TVar Int -> MVar () -> T.Text -> IO ()
-insertPrevious previous previous_pointer previous_count mutex t = do
-    takeMVar mutex 
+insertPrevious :: Room -> T.Text -> IO ()
+insertPrevious room t = do
+    let 
+        memSize = memorySize room
+        previous = buffer $ messages room
+        previousPointer = pointer $ messages room
+        previousCount = count $ messages room
+        mx = mutex $ messages room
+
+    takeMVar mx 
 
     arr <- readTVarIO previous
-    pointer <- readTVarIO previous_pointer
-    count <- readTVarIO previous_count
+    pointer <- readTVarIO previousPointer
+    count <- readTVarIO previousCount
 
-    new_arr <- return $ arr // [(pointer,t)]
-    new_pointer <- return $ (pointer + 1) `mod` 5
-    new_count <- return $ min (count + 1) 5
+    newArr <- return $ arr // [(pointer,t)]
+    newPointer <- return $ (pointer + 1) `mod` memSize
+    newCount <- return $ min (count + 1) memSize
     
-    atomically $ writeTVar previous new_arr
-    atomically $ writeTVar previous_pointer new_pointer
-    atomically $ writeTVar previous_count new_count
+    atomically $ writeTVar previous newArr
+    atomically $ writeTVar previousPointer newPointer
+    atomically $ writeTVar previousCount newCount
 
-    putMVar mutex ()
+    putMVar mx ()
 
 -- send contents of cyclical buffer to user specified by socket
-sendPrevious :: Socket -> TVar (Array Int T.Text) -> TVar Int -> TVar Int -> MVar () -> IO () 
-sendPrevious socket previous previous_pointer previous_count mutex = do
-    takeMVar mutex 
+sendPrevious :: Socket -> Room -> IO () 
+sendPrevious socket room = do
+    let 
+        memSize = memorySize room
+        previous = buffer $ messages room
+        previousPointer = pointer $ messages room
+        previousCount = count $ messages room
+        mx = mutex $ messages room
+
+    takeMVar mx 
 
     arr <- readTVarIO previous
-    pointer <- readTVarIO previous_pointer
-    count <- readTVarIO previous_count
+    pointer <- readTVarIO previousPointer
+    count <- readTVarIO previousCount
 
-    indices <- return [(idx + pointer + (5 - count)) `mod` 5 | idx <- [0..(count-1)]]
+    indices <- return [(idx + pointer + (memSize - count)) `mod` memSize | idx <- [0..(count-1)]]
     mapM_ ((send socket) . E.encodeUtf8 . (\i -> arr!i)) indices
 
-    putMVar mutex ()
+    putMVar mx ()
 
 -- send message to a channel
 message :: [T.Text] -> TChan T.Text -> IO ()
