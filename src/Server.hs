@@ -31,10 +31,11 @@ import                  Data.Array                      as A
 import                  Data.List                       as L
 import                  Data.List.Split
 import                  System.Environment
-import                  Data.Tuple.Extra
-import                  Text.Read
+import                  Data.Tuple.Extra                (uncurry3)
+import                  Text.Read                       (readMaybe)
 
--- Note: the naming would be more precise if we prepended `Shared` to each
+-- cyclical buffer and related variables
+-- note: the naming would be more precise if we prepended `Shared` to each
 type CyclicalBuffer = TVar (A.Array Int T.Text)
 type BufferPointer = TVar Int
 type BufferCount = TVar Int
@@ -43,8 +44,8 @@ type BufferMutex = MVar ()
 -- storing last n messages using cyclical buffer
 data MessageHistory = MessageHistory {
     buffer :: CyclicalBuffer,
-    pointer :: BufferPointer,
-    count :: BufferCount,
+    pointer :: BufferPointer, -- first message position
+    count :: BufferCount, -- number of messages in buffer
     mutex :: BufferMutex
 }
 
@@ -59,14 +60,18 @@ data Room = Room {
     broadcast :: Broadcast
 }
 
--- broadcast messages to all connected users + send stored messages
+-- initialize server, accept and handle incoming requests
 serve :: IO ()
 serve = withSocketsDo $ do
+    -- initialize server according to a configuration file
     config <- getConfigName
     rooms <- parseConfig config
 
+    -- listen to incoming requests
     listen (Host "127.0.0.1") "8000" $ \(listenSocket, listenAddr) -> do
         putStrLn $ "Listening for TCP connections at " ++ show listenAddr
+
+        -- handling single TCP connection
         forever . acceptFork listenSocket $ \(acceptSocket, acceptAddr) -> do
             putStrLn $ "Accepted incoming connection from " ++ show acceptAddr
 
@@ -211,6 +216,7 @@ insertPrevious room t = do
         previousCount = count $ messages room
         mx = mutex $ messages room
 
+    -- lock
     takeMVar mx 
 
     arr <- readTVarIO previous
@@ -225,6 +231,7 @@ insertPrevious room t = do
     atomically $ writeTVar previousPointer newPointer
     atomically $ writeTVar previousCount newCount
 
+    -- unlock
     putMVar mx ()
 
 -- send contents of cyclical buffer to user specified by socket
@@ -237,29 +244,36 @@ sendPrevious socket room = do
         previousCount = count $ messages room
         mx = mutex $ messages room
 
+    -- lock
     takeMVar mx 
 
     arr <- readTVarIO previous
     pointer <- readTVarIO previousPointer
     count <- readTVarIO previousCount
 
+    -- return sequence of indices reflecting correct chronological order of
+    -- messages in buffer, then send them in this order
     indices <- return [(idx + pointer + (memSize - count)) `mod` memSize | idx <- [0..(count-1)]]
     mapM_ ((send socket) . E.encodeUtf8 . (\i -> arr!i)) indices
 
+    -- unlock
     putMVar mx ()
 
 -- send message to a channel
 message :: [T.Text] -> TChan T.Text -> IO ()
 message ts bchan = atomically $ writeTChan bchan (T.concat ts)
 
+-- broadcast that given user has left
 messageLeft :: T.Text -> (TChan T.Text) -> IO ()
 messageLeft name bchan = message text bchan
     where text = [name,(T.pack " has left.\n")]
 
+-- broadcast that given user has joined
 messageJoined :: T.Text -> (TChan T.Text) -> IO ()
 messageJoined name bchan = message text bchan
     where text = [name,(T.pack " has just arrived!\n")]
 
+-- broadcast a message to a room and write it to the cyclical buffer
 messageUser :: T.Text -> T.Text -> TChan T.Text -> (T.Text -> IO ()) -> IO ()
 messageUser name t bchan bufferInsert = do
     message text bchan
