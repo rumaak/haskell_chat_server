@@ -72,9 +72,13 @@ serve = withSocketsDo $ do
 
             -- what room does the user want to join
             maybeRoom <- roomPrompt acceptSocket rooms
+            
+            -- what name does the user want to use
+            maybeName <- namePrompt acceptSocket
+            send acceptSocket "Connected succesfuly!\n"
 
-            case maybeRoom of
-                Just room -> do
+            case (maybeRoom, maybeName) of
+                (Just room, Just name) -> do
                     let bchan = broadcast room
 
                     -- partial function applications
@@ -82,10 +86,10 @@ serve = withSocketsDo $ do
                         bufferInsert = insertPrevious room
                         bufferSend = sendPrevious acceptSocket room
 
-                    messageJoined acceptAddr bchan
-                    finally     (handleClient acceptSocket acceptAddr bchan bufferInsert bufferSend)
-                                (messageLeft acceptAddr bchan)
-                Nothing -> return ()
+                    messageJoined name bchan
+                    finally     (handleClient acceptSocket name bchan bufferInsert bufferSend)
+                                (messageLeft name bchan)
+                _ -> return ()
 
             putStrLn $ "Closing connection from " ++ show acceptAddr
 
@@ -168,9 +172,7 @@ passwordPrompt socket room = do
             -- decoding succeeded
             Right passwd -> 
                 if (password room) == (T.unpack $ T.strip $ passwd)
-                then do
-                    send socket "Connected succesfuly!\n"
-                    return True
+                then return True
                 else do
                     send socket "Wrong password!\n"
                     passwordPrompt socket room
@@ -182,6 +184,22 @@ getRoom :: [Room] -> String -> Maybe Room
 getRoom rooms rName = L.find check rooms
     where 
         check room = (name room) == rName
+
+-- return Just name specified by user or Nothing if he disconnects
+namePrompt :: Socket -> IO (Maybe T.Text)
+namePrompt socket = do 
+    send socket "Choose a nickname: "
+    maybeResponse <- recv socket 4096
+    case maybeResponse of
+        Just response -> case E.decodeUtf8' response of
+            -- decoding failed
+            Left _ -> do 
+                return Nothing
+            -- decoding succeeded
+            Right name -> 
+                return $ Just $ T.strip $ name
+
+        Nothing -> return Nothing
 
 -- insert message to a cyclical buffer (contains last n messages)
 insertPrevious :: Room -> T.Text -> IO ()
@@ -234,28 +252,28 @@ sendPrevious socket room = do
 message :: [T.Text] -> TChan T.Text -> IO ()
 message ts bchan = atomically $ writeTChan bchan (T.concat ts)
 
-messageLeft :: SockAddr -> (TChan T.Text) -> IO ()
-messageLeft addr bchan = message text bchan
-    where text = [(T.pack $ show addr),(T.pack " has left.\n")]
+messageLeft :: T.Text -> (TChan T.Text) -> IO ()
+messageLeft name bchan = message text bchan
+    where text = [name,(T.pack " has left.\n")]
 
-messageJoined :: SockAddr -> (TChan T.Text) -> IO ()
-messageJoined addr bchan = message text bchan
-    where text = [(T.pack $ show addr),(T.pack " has just arrived!\n")]
+messageJoined :: T.Text -> (TChan T.Text) -> IO ()
+messageJoined name bchan = message text bchan
+    where text = [name,(T.pack " has just arrived!\n")]
 
-messageUser :: SockAddr -> T.Text -> TChan T.Text -> (T.Text -> IO ()) -> IO ()
-messageUser addr t bchan bufferInsert = do
+messageUser :: T.Text -> T.Text -> TChan T.Text -> (T.Text -> IO ()) -> IO ()
+messageUser name t bchan bufferInsert = do
     message text bchan
     bufferInsert $ T.concat text
     where 
         noNewln = T.replace (T.pack "\n") T.empty t 
-        text = [(T.pack "["),(T.pack $ show addr),(T.pack "]: "),noNewln,"\n"]
+        text = [(T.pack "["),name,(T.pack "]: "),noNewln,"\n"]
 
 -- handle sending messages from client to server and vice versa
-handleClient :: Socket -> SockAddr -> TChan T.Text -> (T.Text -> IO ()) -> IO () -> IO ()
-handleClient acceptSocket acceptAddr bchan bufferInsert bufferSend = do
+handleClient :: Socket -> T.Text -> TChan T.Text -> (T.Text -> IO ()) -> IO () -> IO ()
+handleClient acceptSocket name bchan bufferInsert bufferSend = do
     dchan <- atomically $ dupTChan bchan
     tid <- deliverMessages acceptSocket dchan bufferSend
-    storeMessages acceptSocket acceptAddr bchan bufferInsert
+    storeMessages acceptSocket name bchan bufferInsert
     killThread tid
 
 -- send messages in buffer to client, check TChan for new messages, send them to given 
@@ -269,8 +287,8 @@ deliverMessages socket dchan bufferSend = do
     return tid
 
 -- store message from given client into TChan and cyclical buffer
-storeMessages :: Socket -> SockAddr -> TChan T.Text -> (T.Text -> IO ()) -> IO ()
-storeMessages socket addr bchan bufferInsert = do
+storeMessages :: Socket -> T.Text -> TChan T.Text -> (T.Text -> IO ()) -> IO ()
+storeMessages socket name bchan bufferInsert = do
     maybeIncoming <- recv socket 4096
     case maybeIncoming of
         Just incoming -> case E.decodeUtf8' incoming of
@@ -279,8 +297,8 @@ storeMessages socket addr bchan bufferInsert = do
                 return ()
             -- decoding succeeded
             Right text -> do
-                messageUser addr (E.decodeUtf8 incoming) bchan bufferInsert
-                storeMessages socket addr bchan bufferInsert
+                messageUser name (E.decodeUtf8 incoming) bchan bufferInsert
+                storeMessages socket name bchan bufferInsert
         Nothing -> return ()
 
 
